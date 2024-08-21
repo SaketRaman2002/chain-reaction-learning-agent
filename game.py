@@ -2,6 +2,20 @@ import pygame
 import numpy as np
 import random
 import copy
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import collections
+import pandas as pd
+import pygame
+from dnq import DQNAgent
+import copy
+from config import params
+
+criterion = nn.MSELoss()
 
 
 # Initialize Pygame
@@ -14,6 +28,7 @@ SCREEN_WIDTH, SCREEN_HEIGHT = BOARD_SIZE*100, BOARD_SIZE*100
 CELL_SIZE = SCREEN_WIDTH // BOARD_SIZE
 BACKGROUND_COLOR = (30, 30, 30)
 PLAYER_COLORS = [(255, 0, 0), (0, 0, 255)]  # Red, Blue
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Helper function to draw the game board
 def draw_board(screen, board):
@@ -89,8 +104,6 @@ class ChainReactionGame:
         if self.board[x, y] == 0 or np.sign(self.board[x, y]) == self.current_player:
             self.board[x, y] += self.current_player
             self.move_count += 1  # Increment move count
-            print(f'Total orbs after move: {self.get_total_orbs()}')
-            print(self.board)
             if abs(self.board[x, y]) >= max_orbs:
                 self.explode_orbs(x, y)
                 if self.check_winner():
@@ -152,6 +165,42 @@ class ChainReactionGame:
         else:
             return 0  # No winner yet
 
+    def agent_move(self, agent, params, counter_games):
+        if not params['train']:
+            agent.epsilon = 0.01
+        else:
+            agent.epsilon = max(0.01, 1 - (counter_games * params['epsilon_decay_linear']))
+        # Get old state
+        state_old = agent.get_state(self).reshape((1, -1))  # Ensure state shape matches input size
+        # Perform random actions based on agent.epsilon, or choose the action
+            # Use the Q-network to predict the Q-values for each valid move
+        valid_moves = self.get_valid_moves()
+        best_score = float('-inf')
+        best_action = None
+        for move in valid_moves:
+            grid_x, grid_y = divmod(move, BOARD_SIZE)
+            game_copy = self.clone()  # Assuming you have a method to clone the game state
+            game_copy.place_orb(grid_x, grid_y)
+            next_state = agent.get_state(game_copy).reshape((1, -1))
+            q_values = agent.forward(torch.tensor(next_state, dtype=torch.float32).to(DEVICE))
+            score = q_values.max().item()
+            if score > best_score:
+                best_score = score
+                best_action = move
+        action = best_action if best_action is not None else random.choice(valid_moves)
+        # Perform new move
+        grid_x, grid_y = divmod(action, BOARD_SIZE)
+        self.place_orb(grid_x, grid_y)
+        state_new = agent.get_state(self).reshape((1, -1))  # Ensure new state shape matches input size
+        # Set reward based on the game state and moves
+        reward = 0
+        q_values = agent.forward(torch.tensor(state_old, dtype=torch.float32).to(DEVICE)) 
+        reward = q_values.max().item()
+        # Train short memory
+        agent.train_short_memory(state_old, action, reward, state_new, self.game_over)
+        # Remember the experience
+        agent.remember(state_old, action, reward, state_new, self.game_over)        
+
     def run(self):
         screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         clock = pygame.time.Clock()
@@ -179,9 +228,90 @@ class ChainReactionGame:
     
         pygame.quit()
 
+    def AgentRun(self, agent, params):
+        pygame.init()
+        agent = DQNAgent(params)
+        agent = agent.to(DEVICE)
+        agent.optimizer = optim.Adam(agent.parameters(), weight_decay=0, lr=params['learning_rate'])
+        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        clock = pygame.time.Clock()
+        running = True
+        counter_games = 0
+        player1_states = []
+        player2_states = []
+        state_scores = {}
+        move_count = 0
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN and self.current_player == 1:
+                    x, y = pygame.mouse.get_pos()
+                    grid_x, grid_y = x // CELL_SIZE, y // CELL_SIZE
+                    if self.is_valid_move(grid_x, grid_y):
+                        self.place_orb(grid_x, grid_y)
+            if self.current_player == -1 and not self.game_over:
+                self.agent_move(agent, params, counter_games)
+            screen.fill(BACKGROUND_COLOR)
+            draw_board(screen, self.board)
+            pygame.display.flip()
+            clock.tick(60)
+            winner = self.check_winner()
+            if winner != 0:
+                print(f"Player {winner} wins!")
+                running = False
+            if params['train']:
+                agent.replay_new(agent.memory, params['batch_size'])
+            winner = self.check_winner()
+            if winner != 0:
+                total_moves = move_count
+                if winner == 1:
+                    # Player 1 is the winner
+                    for state, moves in player1_states:
+                        state_key = tuple(state.flatten())
+                        state_scores[state_key] = 1 / (total_moves - moves)
+                    for state, moves in player2_states:
+                        state_key = tuple(state.flatten())
+                        state_scores[state_key] = -1 / (total_moves - moves)
+                else:
+                    # Player 2 is the winner
+                    for state, moves in player2_states:
+                        state_key = tuple(state.flatten())
+                        state_scores[state_key] = 1 / (total_moves - moves)
+                    for state, moves in player1_states:
+                        state_key = tuple(state.flatten())
+                        state_scores[state_key] = -1 / (total_moves - moves)
+                # Training the model using state_scores
+                agent.train()
+                for state_key, score in state_scores.items():
+                    state_tensor = torch.tensor(state_key, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
+                    target = torch.tensor([score], dtype=torch.float32)
+                    agent.optimizer.zero_grad()
+                    output = agent(state_tensor)
+                    loss = criterion(output, target)
+                    loss.backward()
+                    agent.optimizer.step()
+            counter_games += 1
+        if params['train']:
+            model_weights = agent.state_dict()
+            torch.save(model_weights, params["weights_path"])
+        pygame.quit()            
+
 
 
 # Run the game
 if __name__ == "__main__":
-    game = ChainReactionGame()
-    game.run()
+    if params['train']:
+        agent = DQNAgent(params)
+        if params["load_weights"]:
+            agent.load_state_dict(torch.load(params["weights_path"], map_location=DEVICE))
+        agent.train()  # Set the agent to training mode
+
+        game = ChainReactionGame()
+        game.AgentRun(agent, params)
+
+        # Save the updated weights after the game
+        torch.save(agent.state_dict(), params["weights_path"])
+    else:
+        game = ChainReactionGame()
+        game.run()

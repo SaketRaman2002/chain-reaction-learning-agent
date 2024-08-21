@@ -55,19 +55,6 @@ class DQNAgent(torch.nn.Module):
                 state.append(cell)  # number of orbs and player ID
         return np.array(state)
 
-# def set_reward(self, game, moves):
-#     """
-#     Update the score of each state based on the number of moves it took to win the game.
-#     """
-#     winner = game.check_winner()
-#     if winner == self.agent_target:
-#         score = 1 / moves  # Higher score for fewer moves
-#     else:
-#         score = -1 / moves  # Lower score for more moves
-
-#     for state in self.actual:
-#         state_tuple = tuple(state)
-#         self.state_scores[state_tuple] += score
 
 
     def remember(self, state, action, reward, next_state, done):
